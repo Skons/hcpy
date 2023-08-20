@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 # Contact Bosh-Siemens Home Connect devices
 # and connect their messages to the mqtt server
+# old shebang ohn virtual env: #!/usr/bin/env python3
 import json
 import sys
 import time
+import re
+import traceback
 from threading import Thread
 
 import click
@@ -12,11 +15,12 @@ import paho.mqtt.client as mqtt
 from HCDevice import HCDevice
 from HCSocket import HCSocket, now
 
+debugVerbose = False
 
 @click.command()
 @click.argument("config_file")
 @click.option("-h", "--mqtt_host", default="localhost")
-@click.option("-p", "--mqtt_prefix", default="homeconnect/")
+@click.option("-p", "--mqtt_prefix", default="homie/") # in order to be autodetectable by homie implementations
 @click.option("--mqtt_port", default=1883, type=int)
 @click.option("--mqtt_username")
 @click.option("--mqtt_password")
@@ -24,11 +28,17 @@ from HCSocket import HCSocket, now
 @click.option("--mqtt_cafile")
 @click.option("--mqtt_certfile")
 @click.option("--mqtt_keyfile")
+@click.option("--onoff_bool", is_flag=True)
+@click.option("--publish_as_json", is_flag=True)
+@click.option("--log_debug", is_flag=True)
 def hc2mqtt(config_file: str, mqtt_host: str, mqtt_prefix: str, mqtt_port: int, mqtt_username: str,
-			mqtt_password: str, mqtt_ssl: bool, mqtt_cafile: str, mqtt_certfile: str, mqtt_keyfile: str):
-	click.echo(f"Hello {config_file=} {mqtt_host=} {mqtt_prefix=} {mqtt_port=} {mqtt_username=} {mqtt_password=} "
-			   f"{mqtt_ssl=} {mqtt_cafile=} {mqtt_certfile=} {mqtt_keyfile=}")
-
+			mqtt_password: str, mqtt_ssl: bool, mqtt_cafile: str, mqtt_certfile: str, mqtt_keyfile: str, 
+			onoff_bool: bool, publish_as_json: bool, log_debug: bool):
+	click.echo(f"Hello {config_file} {mqtt_host} {mqtt_prefix} {mqtt_port} {mqtt_username} {mqtt_password} "
+			   f"{mqtt_ssl} {mqtt_cafile} {mqtt_certfile} {mqtt_keyfile} {onoff_bool} {publish_as_json} {log_debug}")
+	global debugVerbose
+	debugVerbose = log_debug
+	
 	with open(config_file, "r") as f:
 		devices = json.load(f)
 
@@ -48,28 +58,64 @@ def hc2mqtt(config_file: str, mqtt_host: str, mqtt_prefix: str, mqtt_port: int, 
 	for device in devices:
 		mqtt_topic = mqtt_prefix + device["name"]
 		print(now(), f"topic: {mqtt_topic}")
-		thread = Thread(target=client_connect, args=(client, device, mqtt_topic))
+		thread = Thread(target=client_connect, args=(client, device, mqtt_topic, onoff_bool, publish_as_json))
 		thread.start()
 
 	client.loop_forever()
+	
 
-# Map their value names to easier state names
-topics = {
-	"OperationState": "state",
-	"DoorState": "door",
-	"RemainingProgramTime": "remaining",
-	"PowerState": "power",
-	"LowWaterPressure": "lowwaterpressure",
-	"AquaStopOccured": "aquastop",
-	"InternalError": "error",
-	"FatalErrorOccured": "error",
-}
+def check_feature_for_MQTT(feature_name, hc2mqtt_conf):
+	#whether to expose this feature as node
+	publish_conf = hc2mqtt_conf["publish"]
+	nopublish_conf = hc2mqtt_conf["publish_never"]
+	if (feature_name in publish_conf["long_names"]):
+		return True
+	elif (feature_name in nopublish_conf["long_names"]):
+		return False
+	
+	for name_part in nopublish_conf["contains"]:
+		if name_part in feature_name:
+			return False
+	
+	for name_part in publish_conf["contains"]:
+		if name_part in feature_name:
+			return True
+	
+	return False
 
-def client_connect(client, device, mqtt_topic):
+def getNodeName(uid, jsonfeatures, hc2mqtt_conf):
+	#gets the node name for the corresping feature
+	feature = jsonfeatures[uid]
+	feature_name = feature["name"]
+	rename_conf = hc2mqtt_conf["rename"]
+	if feature_name in rename_conf:
+		return rename_conf[feature_name]
+	elif rename_conf["default"] == "short":
+		# trim everything off the name except the last part
+		node_name = re.sub(r'^.*\.', '', feature_name)
+		return node_name
+	elif rename_conf["default"] == "long":
+		return feature_name
+	elif rename_conf["default"] == "uid":
+		return uid
+	else:
+		value = rename_conf["default"]
+		raise Exception(f"rename_conf[\"default\"] ==  {value} is not known")
+
+def is_feature_settable(feature):
+	return (("access" in feature and "rite" in feature["access"]) #look case insensitive for "write"
+			or ("Program" in feature["name"])
+			or ("Dishcare.Dishwasher.Option" in feature["name"])
+			or ("Dishcare.Dishwasher.Setting" in feature["name"])
+			or ("BSH.Common.Root.ActiveProgram" == feature["name"])
+			)
+
+
+def client_connect(client, device, mqtt_topic, onoff_bool, publish_as_json):
 	def on_message(client, userdata, msg):
 		global dev
 		mqtt_state = msg.payload.decode()
-		print(now(),f"received mqtt message {mqtt_state}")
+		if debugVerbose: print(now(),f"received mqtt message {mqtt_state}")
 		try:
 			msg = json.loads(mqtt_state)
 			if 'uid' in msg:
@@ -78,65 +124,188 @@ def client_connect(client, device, mqtt_topic):
 				raise Exception(f"Payload {msg} is not correctly formatted")
 		except Exception as e:
 			print("ERROR", e, file=sys.stderr)
+	
+	def on_specific_message(client, userdata, msg):
+		global dev
+		mqtt_state = msg.payload.decode()
+		topic = msg.topic
+		if debugVerbose: print(f"debug topic: {topic}")
+		
+		#extract feature name from mqttTopic/feature_name/value/set
+		prefixLength = len(mqtt_topic) + 1 # +1 cause of backslash
+		suffixLength = -10 # len("/value/set")
+		node_name = topic[prefixLength:suffixLength]
+		if debugVerbose: print(now(),f"received mqtt specific message '{mqtt_state}' on topic '{topic}' extracted node_name '{node_name}'")
+		
+		try:	
+			msg = {}
+			if (features[node_name][0] == "BSH.Common.Root.ActiveProgram"):
+				print(programs)
+				print(programs[mqtt_state])
+				msg["program"] = programs[mqtt_state][1]
+				#Maybe* TODO possible options according to this json format (thanks to @chris-mc1): [{"program":8196, "options":[{"uid":558,"value":0},{"uid":5123,"value":false},{"uid":5126,"value":false},{"uid":5127,"value":false}]}]
+				#*Not easy to implement together with Homie-MQTT protocol (only one value per MQTT topic). Therefore just set the options before starting the porgram.
+				dev.post("/ro/activeProgram",data=msg)
+			else:		
+				#default settable value
+				msg["uid"] = int(features[node_name][1])
+				msg["value"] = mqtt_state
+				dev.post("/ro/values",data=msg)
+			if debugVerbose: print(f"debug msg: {msg}")
+		except Exception as e:
+			print("ERROR on specific message", e, file=sys.stderr)
+	
+	def publish_single(node_name, value):
+		if (node_name in state):
+			if (state[node_name] != value):
+				#to reduce MQTT network traffic spamming only if it is a new value
+				publish_general("/" + node_name + "/value", value)
+		else:
+			if debugVerbose: print(f"node_name {node_name} not in state - not published")
+	
+	def publish_general(topic_sub_name, value):
+		channel = mqtt_topic + topic_sub_name
+		if debugVerbose: print(now(), device["name"], f"publish '{value}' to '{channel}'")
+		client.publish(channel,value,qos=1,retain=True)
+		
+	
+	def expose_node_to_homie(feature, node_name):
+		#to expose this feature as node
+		subtopic_node = "/" + node_name
+		publish_general(subtopic_node+"/$name", feature["name"])
+		publish_general(subtopic_node+"/$type", "type")
+		publish_general(subtopic_node+"/$properties", "value")#generic property for each node
+		
+		subtopic_property = subtopic_node + "/" + "value"
+		publish_general(subtopic_property + "/$name", node_name)
+		if is_feature_settable(feature): 
+			publish_general(subtopic_property + "/$settable", "true")
+			#register listener at mqtt server
+			mqtt_set_topic = mqtt_topic + "/" + node_name + "/value/set"
+			if debugVerbose: print(now(), device["name"], f"registered mqtt_set_topic on '{mqtt_set_topic}'")
+			client.subscribe(mqtt_set_topic,1)
+			client.message_callback_add(mqtt_set_topic, on_specific_message) #register for set topics directly for a specific setting
+		
+		#identify and set datatype
+		enums = []
+		if "values" in feature: 
+			options = feature["values"]
+			for id in options:
+				enums.append(options[id])
+		elif "BSH.Common.Root.ActiveProgram" == feature["name"]:
+			global programs
+			programs = {}
+			for uid in jsonfeatures:
+				feature_name = jsonfeatures[uid]["name"]
+				if ".Program." in feature_name: #working for dishwasher. May has to adapted for other devices
+					short_program_name = getNodeName(uid, jsonfeatures, hc2mqtt_conf)
+					programs[short_program_name] = (feature_name, uid)
+					enums.append(short_program_name)
+		else:
+			#default
+			publish_general(subtopic_property + "/$datatype", "string")
+		
+		if len(enums) != 0:
+			publish_general(subtopic_property + "/$datatype", "enum")
+			enums = ','.join(enums) 
+			publish_general(subtopic_property + "/$format", enums)
 
 	global dev
 	host = device["host"]
+	jsonfeatures = device.get("features", None)
 
+	#expose Homie MQTT
+	publish_general("/$homie", "4.0.0")
+	publish_general("/$name", device["name"])
+	publish_general("/$state", "init")
+	client.will_set(mqtt_topic + "/$state", "lost", 1, True)
+	
+	nodes = ""
 	state = {}
-	for topic in topics:
-		state[topics[topic]] = None
+	features = {} #some definitions: feature = the json object of one feature; feature_name = Bosch.Setting.XXX; node_name = XXX
+	hc2mqtt_conf = device["hc2mqtt"]
+	if debugVerbose: print(now(), device["name"], f"hc2mqtt_conf: '{hc2mqtt_conf}'")
+	for uid in jsonfeatures:
+		feature = jsonfeatures[uid]
+		feature_name = feature["name"]
+		if check_feature_for_MQTT(feature_name, hc2mqtt_conf):
+			node_name = getNodeName(uid, jsonfeatures, hc2mqtt_conf)
+			features[node_name] = (feature_name, uid)
+			nodes = nodes + node_name + "," 
+			expose_node_to_homie(feature, node_name)
+			state[node_name] = None
 
-	mqtt_set_topic = mqtt_topic + "/set"
-	print(now(), device["name"], f"set topic: {mqtt_set_topic}")
-	client.subscribe(mqtt_set_topic)
-	client.on_message = on_message
+	nodes = nodes[:-1] #remove last comma
+	publish_general("/$nodes", nodes)
+
+	if publish_as_json:
+		mqtt_set_topic = mqtt_topic + "/state/set"
+		client.subscribe(mqtt_set_topic,1)
+		client.message_callback_add(mqtt_set_topic, on_specific_message) #register for set topics directly for a specific setting
+		client.on_message = on_message #fallback mqtt callback used for json payload
 
 	while True:
 		try:
 			ws = HCSocket(host, device["key"], device.get("iv",None))
-			dev = HCDevice(ws, device.get("features", None), device["name"])
+			dev = HCDevice(ws, jsonfeatures, device["name"], device["description"])
 
 			#ws.debug = True
 			ws.reconnect()
+			publish_general("/$state", "ready")
 
 			while True:
 				msg = dev.recv()
 				if msg is None:
+					if debugVerbose: print(now(), device["name"], f"hc2mqtt while True msg = None")
 					break
 				if len(msg) > 0:
-					print(now(), device["name"], msg)
-
+					if debugVerbose: print(now(), device["name"], f"hc2mqtt while True msg = {msg}")
+				if 'error' in msg:
+					#this is an error message due to http 404 or similar connection errors, not state errors
+					if debugVerbose: print(now(), device["name"], f"hc2mqtt while True ERROR msg = {msg}")
+					continue #todo test that error states are not cut away
+				
 				update = False
-				for topic in topics:
-					value = msg.get(topic, None)
+				for uid in jsonfeatures:
+					value = msg.get(uid, None)
 					if value is None:
 						continue
-
-					# Convert "On" to True, "Off" to False
-					if value == "On":
-						value = True
-					elif value == "Off":
-						value = False
-
-					new_topic = topics[topic]
-					if new_topic == "remaining":
-						state["remainingseconds"] = value
+					
+					# Convert "On" to True, "Off" to False if specified in options
+					if onoff_bool:
+						if value == "On":
+							value = True
+						elif value == "Off":
+							value = False
+	
+					node_name = getNodeName(uid, jsonfeatures, hc2mqtt_conf)
+					if debugVerbose: print(now(), device["name"], f"hc2mqtt uid for '{node_name}' in msg = {msg[uid]}")
+					publish_single(node_name, value)
+					state[node_name] = value
+					if node_name == "remaining":
 						value = "%d:%02d" % (value / 60 / 60, (value / 60) % 60)
-
-					state[new_topic] = value
+						publish_single("remainingseconds" ,value)
+						state["remainingseconds"] = value
+						
 					update = True
 
 				if not update:
 					continue
 
 				msg = json.dumps(state)
-				print(now(), device["name"], f"publish to {mqtt_topic} with {msg}")
-				client.publish(mqtt_topic + "/state", msg)
+				if publish_as_json:
+					publish_general("/state", msg) # not needed for Homie - backwards compatiblity of this script
+
 
 		except Exception as e:
-			print("ERROR", host, e, file=sys.stderr)
+			print("ERROR", host, e + "\n"+ traceback.format_exc(), file=sys.stderr)
+#			publish_general("/$state", "lost")
 
 		time.sleep(5)
-
+	
+	#TODO: if program exit (does it reach here when aborted?)
+	publish_general("/$state", "lost")
+	print(now(), f"Thread for {device['name']} exits.")
+	
 if __name__ == "__main__":
 	hc2mqtt()

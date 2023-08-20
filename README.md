@@ -52,10 +52,51 @@ hc2mqtt config.json
 ```
 
 This tool will establish websockets to the local devices and
-transform their messages into MQTT JSON messages.  The exact
-format is likely to change; it is currently a thin translation
+transform their messages into MQTT JSON messages.  
+Default for MQTT publishing is the [Homie MQTT Convention]{https://homieiot.github.io/specification/}. 
+This is useful for automatic detection in smart-home systems.
+Additionally publishing as one whole json can be chosen as a thin translation
 layer over the XML retrieved from cloud servers during the
 initial configuration.
+
+For renaming of the features you manually have to add a json entry "hc2mqtt" like this one inside your generated config file:
+
+```
+[
+    {
+        "name":yourDishwasherName
+	"host":...
+	"key":...
+	"description": {
+		"type": "Dishwasher",
+		...
+    	},
+        "hc2mqtt": {
+            "rename": {
+				"default": "short",
+				"Dishcare.Dishwasher.Setting.ExtraDry": "ExtraDrySet"
+			},
+            "publish": {
+				"contains": ["BSH.Common.Event.","BSH.Common.Option.","BSH.Common.Root.","BSH.Common.Setting.","BSH.Common.Status.","Dishcare.Dishwasher.Event.","Dishcare.Dishwasher.Option.","Dishcare.Dishwasher.Status.","Dishcare.Dishwasher.Setting."],
+				"long_names": []
+			},
+            "publish_never": {
+				"contains": [],
+				"long_names": []
+			}
+        },
+        "features": {
+	...
+	}
+]
+```
+In "rename" you can define the default naming behaviour for MQTT exposing ("short" ( = last part of the name), "long" or "uid") or specify explicit renaming for some features (overwrites default setting).
+In "publish" and "publish never" you can specify which features shall be or shall not be published to MQTT. With following priority:
+- feature name is exactly specified in long_names (individual names of features) in "publish" => publish
+- if not: long_names specified in "publish_never" => do not publish
+- if not: "publish_never" contains a substring of the feature name => publish not
+- if not: "publish" contains a substring of the feature name => publish
+- if not: => publish not.
 
 ### Dishwasher
 
